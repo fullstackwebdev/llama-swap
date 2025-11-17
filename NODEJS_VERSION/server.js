@@ -3,6 +3,7 @@ const cors = require('cors');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const { program } = require('commander');
 const fs = require('fs');
+const path = require('path');
 const ConfigLoader = require('./config-loader');
 const { ProcessManager, ProcessState } = require('./process-manager');
 const { createLogger, format, transports } = require('winston');
@@ -24,6 +25,62 @@ if (options.version) {
   process.exit(0);
 }
 
+
+// At the top of your file, after creating the app
+const proxyCache = new Map();
+
+function getOrCreateProxy(target, pathRewrite) {
+  const cacheKey = `${target}:${JSON.stringify(pathRewrite)}`;
+  
+  if (!proxyCache.has(cacheKey)) {
+    const proxy = createProxyMiddleware({
+      target,
+      changeOrigin: true,
+      pathRewrite,
+      logLevel: 'debug',
+      
+      // CRITICAL: Add these options for streaming support
+      selfHandleResponse: false,
+      ws: true,
+      
+      onProxyReq: (proxyReq, req, res) => {
+        logger.debug(`Proxying ${req.method} ${req.path} to ${target}`);
+        
+        // Write the raw body if we have it
+        if (req.rawBody) {
+          // Set correct headers
+          if (!proxyReq.getHeader('content-type')) {
+            proxyReq.setHeader('Content-Type', req.headers['content-type'] || 'application/json');
+          }
+          proxyReq.setHeader('Content-Length', Buffer.byteLength(req.rawBody));
+          
+          // Write the body
+          proxyReq.write(req.rawBody);
+          proxyReq.end();
+        }
+      },
+      
+      onProxyRes: (proxyRes, req, res) => {
+        logger.debug(`Received response with status ${proxyRes.statusCode}`);
+        
+        // For streaming responses, don't buffer
+        if (proxyRes.headers['content-type']?.includes('text/event-stream')) {
+          logger.debug('Streaming response detected');
+        }
+      },
+      
+      onError: (err, req, res) => {
+        logger.error(`Proxy error: ${err.message}`);
+        if (!res.headersSent) {
+          res.status(500).json({ error: 'Proxy error: ' + err.message });
+        }
+      }
+    });
+    proxyCache.set(cacheKey, proxy);
+  }
+  
+  return proxyCache.get(cacheKey);
+}
 // Create loggers
 const logger = createLogger({
   level: 'info',
@@ -86,9 +143,50 @@ const app = express();
 // Enable CORS
 app.use(cors());
 
-// Parse JSON bodies
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+const getRawBody = require('raw-body');
+const contentType = require('content-type');
+
+// Replace your current conditional middleware with this:
+app.use(async (req, res, next) => {
+  // For upstream routes, capture the raw body
+  if (req.path.startsWith('/upstream/')) {
+    if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
+      try {
+        const raw = await getRawBody(req, {
+          length: req.headers['content-length'],
+          limit: '50mb',
+          encoding: contentType.parse(req).parameters.charset || 'utf-8'
+        });
+        req.rawBody = raw;
+        
+        // Also parse as JSON if applicable for logging
+        if (req.headers['content-type']?.includes('application/json')) {
+          try {
+            req.body = JSON.parse(raw);
+          } catch (e) {
+            // Ignore parse errors
+          }
+        }
+      } catch (err) {
+        logger.error(`Error reading raw body: ${err.message}`);
+      }
+    }
+    return next();
+  }
+  
+  // For non-upstream routes, use regular JSON parsing
+  express.json({ limit: '50mb' })(req, res, next);
+});
+
+app.use((req, res, next) => {
+  if (req.path.startsWith('/upstream/')) {
+    return next();
+  }
+  express.urlencoded({ extended: true, limit: '50mb' })(req, res, next);
+});
+
+// Remove this line - it's redundant:
+// app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // Handle multipart forms (for audio/speech, audio/transcriptions)
 app.use('/v1/audio', express.raw({ type: 'multipart/form-data', limit: '50mb' }));
@@ -105,7 +203,233 @@ if (config.logRequests) {
   });
 }
 
+// Set up event broadcasting for server-sent events
+const eventClients = new Set();
+let metricsData = [];
+
+// Add event listener for process state changes
+function setupProcessStateListeners() {
+  for (const group of processManager.processGroups.values()) {
+    for (const process of group.processes.values()) {
+      process.removeAllListeners('stateChange'); // Remove any existing listeners to avoid duplicates
+      process.on('stateChange', (stateChange) => {
+        // Broadcast model status update
+        const modelStatusUpdate = {
+          type: "modelStatus",
+          data: JSON.stringify(getAllModelStatuses())
+        };
+        broadcastEvent(modelStatusUpdate);
+      });
+    }
+  }
+}
+
+setupProcessStateListeners();
+
+function broadcastEvent(event) {
+  const eventData = `data: ${JSON.stringify(event)}\n\n`;
+  for (const client of eventClients) {
+    try {
+      client.write(eventData);
+    } catch (err) {
+      // Client disconnected
+      eventClients.delete(client);
+    }
+  }
+}
+
+function getAllModelStatuses() {
+  const statuses = [];
+
+  for (const [groupId, group] of processManager.processGroups) {
+    for (const [modelId, process] of group.processes) {
+      const modelConfig = config.models[modelId];
+      statuses.push({
+        id: modelId,
+        state: process.getCurrentState(),
+        name: modelConfig.name || '',
+        description: modelConfig.description || '',
+        unlisted: !!modelConfig.unlisted
+      });
+    }
+  }
+
+  return statuses;
+}
+
+
 // API endpoints
+app.use((req, res, next) => {
+  logger.info(`Incoming request: ${req.method} ${req.path} (original: ${req.originalUrl})`);
+  next();
+});
+// Server-sent events endpoint for real-time updates
+app.get('/api/events', (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'Access-Control-Allow-Origin': '*'
+  });
+
+  // Send initial data
+  const initialModelStatus = {
+    type: "modelStatus",
+    data: JSON.stringify(getAllModelStatuses())
+  };
+  res.write(`data: ${JSON.stringify(initialModelStatus)}\n\n`);
+
+  eventClients.add(res);
+
+  req.on('close', () => {
+    eventClients.delete(res);
+  });
+});
+
+// List available models (Go version API compatibility)
+app.get('/api/models/', (req, res) => {
+  const data = [];
+  const createdTime = Math.floor(Date.now() / 1000);
+
+  for (const [id, modelConfig] of Object.entries(config.models)) {
+    if (modelConfig.unlisted) {
+      continue;
+    }
+
+    const newRecord = (modelId) => {
+      const record = {
+        id: modelId,
+        object: 'model',
+        created: createdTime,
+        owned_by: 'llama-swap',
+      };
+
+      if (modelConfig.name && modelConfig.name.trim() !== '') {
+        record.name = modelConfig.name.trim();
+      }
+      if (modelConfig.description && modelConfig.description.trim() !== '') {
+        record.description = modelConfig.description.trim();
+      }
+
+      // Add metadata if present
+      if (modelConfig.metadata && Object.keys(modelConfig.metadata).length > 0) {
+        record.meta = {
+          llamaswap: modelConfig.metadata
+        };
+      }
+      return record;
+    };
+
+    data.push(newRecord(id));
+
+    // Include aliases
+    if (config.includeAliasesInList && modelConfig.aliases) {
+      for (const alias of modelConfig.aliases) {
+        if (alias && alias.trim() !== '') {
+          data.push(newRecord(alias.trim()));
+        }
+      }
+    }
+  }
+
+  // Sort by the "id" key
+  data.sort((a, b) => a.id.localeCompare(b.id));
+
+  // Set CORS headers if origin exists
+  if (req.get('Origin')) {
+    res.header('Access-Control-Allow-Origin', req.get('Origin'));
+  }
+
+  res.json({
+    object: 'list',
+    data: data
+  });
+});
+
+// Unload all models (Go version API compatibility)
+app.post('/api/models/unload', async (req, res) => {
+  try {
+    await processManager.shutdownAll();
+    res.status(200).send('OK');
+  } catch (err) {
+    logger.error(`Error unloading models: ${err.message}`);
+    res.status(500).json({ error: 'Error unloading models' });
+  }
+});
+
+// Unload specific model (Go version API compatibility)
+app.post('/api/models/unload/:model', async (req, res) => {
+  const modelName = req.params.model;
+
+  try {
+    // Find the process group that contains this model
+    const processGroup = processManager.findGroupByModelName(modelName);
+    if (!processGroup) {
+      return res.status(404).json({ error: `Model ${modelName} not found` });
+    }
+
+    // Stop the specific process
+    await processGroup.stopProcess(modelName);
+    res.status(200).send('OK');
+  } catch (err) {
+    logger.error(`Error unloading model ${modelName}: ${err.message}`);
+    res.status(500).json({ error: `Error unloading model: ${err.message}` });
+  }
+});
+
+// Load model via upstream path and proxy to its service root
+app.get('/upstream/:model/', async (req, res) => {
+  const modelName = req.params.model;
+
+  try {
+    const { processGroup, realModelName } = await processManager.swapProcessGroup(modelName);
+
+    // Get the specific process for this model and ensure it's ready
+    const process = processGroup.processes.get(realModelName);
+    if (!process) {
+      throw new Error(`Could not find process for model ${realModelName}`);
+    }
+
+    // Start the process if it's not already ready
+    if (process.getCurrentState() !== ProcessState.READY) {
+      logger.info(`<${realModelName}> Starting model process...`);
+      const success = await process.start();
+      if (!success) {
+        throw new Error(`Failed to start process for model ${realModelName}`);
+      }
+      logger.info(`<${realModelName}> Model process started successfully`);
+    }
+
+    // Get the model's proxy configuration
+    const modelConfig = config.models[realModelName];
+    if (!modelConfig || !modelConfig.proxy) {
+      throw new Error(`No proxy configuration found for model ${realModelName}`);
+    }
+
+    // Use the http-proxy-middleware to proxy the request to the model's service
+    const proxyOptions = {
+      target: modelConfig.proxy,
+      changeOrigin: true,
+      pathRewrite: {
+        [`^/upstream/${modelName}`]: ''  // Remove the /upstream/modelname part
+      },
+      onProxyReq: (proxyReq, req, res) => {
+        logger.debug(`<${realModelName}> Proxying request to ${modelConfig.proxy}`);
+      },
+      onProxyRes: (proxyRes, req, res) => {
+        logger.debug(`<${realModelName}> Received response with status ${proxyRes.statusCode}`);
+      }
+    };
+
+    // Apply the proxy middleware
+    createProxyMiddleware(proxyOptions)(req, res, () => {
+      res.status(500).json({ error: 'Proxy error' });
+    });
+  } catch (err) {
+    logger.error(`Error loading model: ${err.message}`);
+    res.status(500).json({ error: `error loading model: ${err.message}` });
+  }
+});
 
 // List available models
 app.get('/v1/models', (req, res) => {
@@ -335,11 +659,9 @@ for (const endpoint of openaiEndpoints) {
   });
 }
 
-// Proxy to upstream models via path
 app.all('/upstream/*', async (req, res) => {
-  const upstreamPath = req.params[0]; // This captures everything after /upstream/
+  const upstreamPath = req.params[0];
   
-  // Split the path and search for the model name
   const parts = upstreamPath.split('/').filter(part => part !== '');
   if (parts.length === 0) {
     return res.status(400).json({ error: 'model id required in path' });
@@ -364,8 +686,6 @@ app.all('/upstream/*', async (req, res) => {
       remainingPath = '/' + parts.slice(i + 1).join('/');
       modelFound = true;
       
-      // Check if this is exactly a model name with no additional path
-      // and doesn't end with a trailing slash
       if (remainingPath === '/' && !upstreamPath.endsWith('/')) {
         const newPath = `/upstream/${searchModelName}/`;
         const query = req.url.split('?')[1];
@@ -382,17 +702,13 @@ app.all('/upstream/*', async (req, res) => {
 
   try {
     const { processGroup, realModelName } = await processManager.swapProcessGroup(modelName);
-
-    // Get model config
     const modelConfig = config.models[realModelName];
-
-    // Get the specific process for this model and ensure it's ready
     const process = processGroup.processes.get(realModelName);
+    
     if (!process) {
       throw new Error(`Could not find process for model ${realModelName}`);
     }
 
-    // Start the process if it's not already ready
     if (process.getCurrentState() !== ProcessState.READY) {
       logger.info(`<${realModelName}> Starting model process...`);
       const success = await process.start();
@@ -402,30 +718,22 @@ app.all('/upstream/*', async (req, res) => {
       logger.info(`<${realModelName}> Model process started successfully`);
     }
 
-    // Proxy the request to the model's server
-    const proxyOptions = {
-      target: modelConfig.proxy,
-      changeOrigin: true,
-      pathRewrite: {
-        [`^/upstream/${modelName}`]: remainingPath
-      },
-      onProxyReq: (proxyReq, req, res) => {
-        logger.debug(`<${realModelName}> Proxying upstream request to ${modelConfig.proxy}`);
-      },
-      onProxyRes: (proxyRes, req, res) => {
-        logger.debug(`<${realModelName}> Received upstream response with status ${proxyRes.statusCode}`);
-      }
-    };
+    // Log what we're about to proxy
+    logger.info(`Proxying /upstream/${searchModelName}${remainingPath} to ${modelConfig.proxy}${remainingPath}`);
 
-    // Apply the proxy middleware
-    createProxyMiddleware(proxyOptions)(req, res, () => {
-      res.status(500).json({ error: 'Proxy error' });
+    // Use the cached proxy
+    const proxy = getOrCreateProxy(modelConfig.proxy, {
+      [`^/upstream/${searchModelName}`]: ''  // This will strip /upstream/modelName
     });
+    
+    proxy(req, res);
+    
   } catch (err) {
     logger.error(`Error proxying upstream request: ${err.message}`);
     res.status(500).json({ error: `error proxying request: ${err.message}` });
   }
 });
+
 
 // Health check endpoint
 app.get('/health', (req, res) => {
@@ -435,7 +743,7 @@ app.get('/health', (req, res) => {
 // Get running models
 app.get('/running', (req, res) => {
   const runningProcesses = [];
-  
+
   for (const [groupId, group] of processManager.processGroups) {
     for (const [modelId, process] of group.processes) {
       if (process.getCurrentState() === ProcessState.READY) {
@@ -446,7 +754,7 @@ app.get('/running', (req, res) => {
       }
     }
   }
-  
+
   res.json({ running: runningProcesses });
 });
 
@@ -459,6 +767,17 @@ app.get('/unload', async (req, res) => {
     logger.error(`Error unloading models: ${err.message}`);
     res.status(500).json({ error: 'Error unloading models' });
   }
+});
+
+// Static file serving for UI
+const UI_DIR = path.join(__dirname, 'dist', 'ui');
+
+// Serve static files from the UI directory
+app.use('/ui', express.static(UI_DIR));
+
+// Catch-all route to serve the UI for any route under /ui
+app.get('/ui/*', (req, res) => {
+  res.sendFile(path.join(UI_DIR, 'index.html'));
 });
 
 // Set up signal handlers for graceful shutdown

@@ -407,6 +407,9 @@ class ProcessManager {
     
     this.processGroups = new Map();
     this.shutdown = false;
+    
+    // ADD THIS: Track the last active group
+    this.lastActiveGroup = null;
 
     // Create process groups
     for (const [groupID] of Object.entries(config.groups)) {
@@ -415,7 +418,7 @@ class ProcessManager {
     }
   }
 
-  async swapProcessGroup(requestedModel) {
+async swapProcessGroup(requestedModel) {
     const realModelName = this.config.aliases[requestedModel] ||
                           (this.config.models[requestedModel] ? requestedModel : null);
 
@@ -428,17 +431,53 @@ class ProcessManager {
       throw new Error(`Could not find process group for model ${requestedModel}`);
     }
 
+    // Cross-group swapping
+    if (this.lastActiveGroup && 
+        this.lastActiveGroup !== processGroup && 
+        !this.lastActiveGroup.persistent &&
+        !processGroup.persistent) {
+      
+      this.proxyLogger.info(`Swapping from group ${this.lastActiveGroup.id} to ${processGroup.id}`);
+      await this.lastActiveGroup.stopProcesses(StopStrategy.WAIT_FOR_INFLIGHT);
+      
+      // ✅ FIX: Clear the last used process
+      this.lastActiveGroup.lastUsedProcess = '';
+    }
+
+    // Exclusive mode
     if (processGroup.exclusive) {
       this.proxyLogger.debug(`Exclusive mode for group ${processGroup.id}, stopping other process groups`);
       for (const [groupId, otherGroup] of this.processGroups) {
         if (groupId !== processGroup.id && !otherGroup.persistent) {
           await otherGroup.stopProcesses(StopStrategy.WAIT_FOR_INFLIGHT);
+          otherGroup.lastUsedProcess = '';  // ✅ FIX: Clear
         }
       }
     }
 
+    // Within-group swapping
+    if (processGroup.swap && processGroup.lastUsedProcess !== realModelName) {
+      if (processGroup.lastUsedProcess && processGroup.processes.has(processGroup.lastUsedProcess)) {
+        const oldProcess = processGroup.processes.get(processGroup.lastUsedProcess);
+        if (oldProcess.getCurrentState() === ProcessState.READY) {
+          this.proxyLogger.info(`Swapping within group ${processGroup.id} from ${processGroup.lastUsedProcess} to ${realModelName}`);
+          await oldProcess.stop(StopStrategy.WAIT_FOR_INFLIGHT);
+          
+          // ✅ FIX: Wait for it to actually stop
+          while (oldProcess.getCurrentState() === ProcessState.STOPPING) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+          }
+        }
+      }
+    }
+
+    // ✅ FIX: Update tracking BEFORE returning
+    this.lastActiveGroup = processGroup;
+    processGroup.lastUsedProcess = realModelName;  // ← THIS WAS MISSING!
+
     return { processGroup, realModelName };
   }
+
 
   findGroupByModelName(modelName) {
     for (const group of this.processGroups.values()) {

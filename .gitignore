@@ -6,3 +6,4 @@ dist/
 .DS_Store
 .dev/
 NODEJS_VERSION/node_modules/
+NODEJS_VERSION/ui/node_modules/
