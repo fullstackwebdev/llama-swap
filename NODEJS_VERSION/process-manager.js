@@ -355,7 +355,7 @@ class ProcessGroup {
     // Get the process and handle the request
     const process = this.processes.get(modelID);
     process.addInFlightRequest();
-    
+
     try {
       // This is where the actual proxying would happen
       // For now, this is just a placeholder

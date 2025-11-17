@@ -1,9 +1,12 @@
 # Use the llama-swap base image with CUDA support that includes vllm and llama-server
 FROM ghcr.io/mostlygeek/llama-swap:cuda
 
-# Install Node.js and npm
-RUN apt-get update && \
-    apt-get install -y nodejs npm && \
+# Switch to root to install additional packages
+USER root
+
+# Install NodeSource repository and a more recent Node.js version (18.x)
+RUN curl -fsSL https://deb.nodesource.com/setup_18.x | bash - && \
+    apt-get install -y nodejs && \
     rm -rf /var/lib/apt/lists/*
 
 # Set working directory
@@ -27,4 +30,6 @@ RUN chown -R llama-swap:root /app
 USER llama-swap
 
 # Start the application
-CMD ["npm", "start"]
+# CMD ["npm", "start"]
+
+ENTRYPOINT [ "npm", "start" ] 

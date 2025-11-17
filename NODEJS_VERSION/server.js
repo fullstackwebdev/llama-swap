@@ -180,24 +180,40 @@ app.post('/v1/chat/completions', async (req, res) => {
   }
 
   try {
-    const { processGroup } = await processManager.swapProcessGroup(requestedModel);
-    
+    const { processGroup, realModelName } = await processManager.swapProcessGroup(requestedModel);
+
+    // Get the specific process for this model and ensure it's ready
+    const process = processGroup.processes.get(realModelName);
+    if (!process) {
+      throw new Error(`Could not find process for model ${realModelName}`);
+    }
+
+    // Start the process if it's not already ready
+    if (process.getCurrentState() !== ProcessState.READY) {
+      logger.info(`<${realModelName}> Starting model process...`);
+      const success = await process.start();
+      if (!success) {
+        throw new Error(`Failed to start process for model ${realModelName}`);
+      }
+      logger.info(`<${realModelName}> Model process started successfully`);
+    }
+
     // Modify the request to use the correct model name if needed
     if (modelConfig.useModelName) {
       req.body.model = modelConfig.useModelName;
     }
-    
+
     // Strip parameters if configured
     if (modelConfig.filters && modelConfig.filters.stripParams) {
       const stripParams = modelConfig.filters.stripParams.split(',')
         .map(param => param.trim())
         .filter(param => param !== 'model' && param !== '');
-      
+
       for (const param of stripParams) {
         delete req.body[param];
       }
     }
-    
+
     // Proxy the request to the model's server
     const proxyOptions = {
       target: modelConfig.proxy,
@@ -212,7 +228,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         logger.debug(`<${realModelName}> Received response with status ${proxyRes.statusCode}`);
       }
     };
-    
+
     // Apply the proxy middleware
     createProxyMiddleware(proxyOptions)(req, res, () => {
       res.status(500).json({ error: 'Proxy error' });
@@ -253,8 +269,24 @@ for (const endpoint of openaiEndpoints) {
     }
 
     try {
-      const { processGroup } = await processManager.swapProcessGroup(requestedModel);
-      
+      const { processGroup, realModelName } = await processManager.swapProcessGroup(requestedModel);
+
+      // Get the specific process for this model and ensure it's ready
+      const process = processGroup.processes.get(realModelName);
+      if (!process) {
+        throw new Error(`Could not find process for model ${realModelName}`);
+      }
+
+      // Start the process if it's not already ready
+      if (process.getCurrentState() !== ProcessState.READY) {
+        logger.info(`<${realModelName}> Starting model process...`);
+        const success = await process.start();
+        if (!success) {
+          throw new Error(`Failed to start process for model ${realModelName}`);
+        }
+        logger.info(`<${realModelName}> Model process started successfully`);
+      }
+
       // Modify the request to use the correct model name if needed
       if (modelConfig.useModelName) {
         if (req.body && req.body.model) {
@@ -263,20 +295,20 @@ for (const endpoint of openaiEndpoints) {
           req.query.model = modelConfig.useModelName;
         }
       }
-      
+
       // Strip parameters if configured
       if (modelConfig.filters && modelConfig.filters.stripParams) {
         const stripParams = modelConfig.filters.stripParams.split(',')
           .map(param => param.trim())
           .filter(param => param !== 'model' && param !== '');
-        
+
         if (req.body) {
           for (const param of stripParams) {
             delete req.body[param];
           }
         }
       }
-      
+
       // Proxy the request to the model's server
       const proxyOptions = {
         target: modelConfig.proxy,
@@ -291,7 +323,7 @@ for (const endpoint of openaiEndpoints) {
           logger.debug(`<${realModelName}> Received response with status ${proxyRes.statusCode}`);
         }
       };
-      
+
       // Apply the proxy middleware
       createProxyMiddleware(proxyOptions)(req, res, () => {
         res.status(500).json({ error: 'Proxy error' });
@@ -350,10 +382,26 @@ app.all('/upstream/*', async (req, res) => {
 
   try {
     const { processGroup, realModelName } = await processManager.swapProcessGroup(modelName);
-    
+
     // Get model config
     const modelConfig = config.models[realModelName];
-    
+
+    // Get the specific process for this model and ensure it's ready
+    const process = processGroup.processes.get(realModelName);
+    if (!process) {
+      throw new Error(`Could not find process for model ${realModelName}`);
+    }
+
+    // Start the process if it's not already ready
+    if (process.getCurrentState() !== ProcessState.READY) {
+      logger.info(`<${realModelName}> Starting model process...`);
+      const success = await process.start();
+      if (!success) {
+        throw new Error(`Failed to start process for model ${realModelName}`);
+      }
+      logger.info(`<${realModelName}> Model process started successfully`);
+    }
+
     // Proxy the request to the model's server
     const proxyOptions = {
       target: modelConfig.proxy,
@@ -368,7 +416,7 @@ app.all('/upstream/*', async (req, res) => {
         logger.debug(`<${realModelName}> Received upstream response with status ${proxyRes.statusCode}`);
       }
     };
-    
+
     // Apply the proxy middleware
     createProxyMiddleware(proxyOptions)(req, res, () => {
       res.status(500).json({ error: 'Proxy error' });
