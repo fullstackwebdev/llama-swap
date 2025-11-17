@@ -1,0 +1,79 @@
+# llama-swap YAML configuration example
+# Default configuration for testing
+
+# healthCheckTimeout: number of seconds to wait for a model to be ready to serve requests
+healthCheckTimeout: 120
+
+# logLevel: sets the logging value
+logLevel: info
+
+# startPort: sets the starting port number for the automatic ${PORT} macro.
+startPort: 5800
+
+# sendLoadingState: inject loading status updates into the reasoning (thinking) field
+sendLoadingState: false
+
+# includeAliasesInList: present aliases within the /v1/models OpenAI API listing
+includeAliasesInList: false
+
+# macros: a dictionary of string substitutions
+macros:
+  default_ctx: 4096
+  default_args: "--ctx-size ${default_ctx}"
+
+# models: a dictionary of model configurations
+models:
+  "test-model":
+    # cmd: the command to run to start the inference server.
+    # For test purposes, we'll use a simple http server on the assigned port
+    cmd: "node -e \"console.log('Server running on port ${PORT}'); require('http').createServer((req, res) => { res.writeHead(200, {'Content-Type': 'application/json'}); res.end('{\\\"status\\\":\\\"ok\\\"}'); }).listen(${PORT}, () => console.log('Listening on port ${PORT}')); setTimeout(() => process.exit(), 300000);\""
+
+    # name: a display name for the model
+    name: "Test Model"
+
+    # description: a description for the model
+    description: "A test model for verification"
+
+    # proxy: the URL where llama-swap routes API requests
+    proxy: http://127.0.0.1:${PORT}
+
+    # aliases: alternative model names that this model configuration is used for
+    aliases:
+      - "gpt-4-test"
+      - "test-alias"
+
+    # checkEndpoint: URL path to check if the server is ready
+    checkEndpoint: /  # Health check will go to root path
+
+    # ttl: automatically unload the model after ttl seconds
+    ttl: 0
+
+    # useModelName: override the model name that is sent to upstream server
+    useModelName: ""
+
+    # filters: a dictionary of filter settings
+    filters:
+      # stripParams: a comma separated list of parameters to remove from the request
+      stripParams: ""
+
+    # metadata: a dictionary of arbitrary values that are included in /v1/models
+    metadata:
+      port: ${PORT}
+      context: ${default_ctx}
+      note: "This is a test model running on port ${PORT}"
+
+    # concurrencyLimit: overrides the allowed number of active parallel requests to a model
+    concurrencyLimit: 0
+
+# groups: a dictionary of group settings
+groups:
+  "default-group":
+    swap: true
+    exclusive: true
+    members:
+      - "test-model"
+
+# hooks: a dictionary of event triggers and actions
+hooks:
+  on_startup:
+    preload: []
