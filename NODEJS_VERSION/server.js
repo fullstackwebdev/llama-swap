@@ -146,35 +146,49 @@ app.use(cors());
 const getRawBody = require('raw-body');
 const contentType = require('content-type');
 
-// Replace your current conditional middleware with this:
 app.use(async (req, res, next) => {
-  // For upstream routes, capture the raw body
-  if (req.path.startsWith('/upstream/')) {
-    if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
-      try {
-        const raw = await getRawBody(req, {
-          length: req.headers['content-length'],
-          limit: '50mb',
-          encoding: contentType.parse(req).parameters.charset || 'utf-8'
-        });
-        req.rawBody = raw;
-        
-        // Also parse as JSON if applicable for logging
-        if (req.headers['content-type']?.includes('application/json')) {
-          try {
-            req.body = JSON.parse(raw);
-          } catch (e) {
-            // Ignore parse errors
-          }
+  // For routes that will be proxied, capture the raw body
+  const proxyRoutes = [
+    '/upstream/',
+    '/v1/chat/completions',
+    '/v1/completions',
+    '/v1/embeddings',
+    '/reranking',
+    '/rerank',
+    '/v1/rerank',
+    '/v1/reranking',
+    '/infill',
+    '/completion',
+    '/v1/audio/speech',
+    '/v1/audio/transcriptions'
+  ];
+
+  const needsRawBody = proxyRoutes.some(route => req.path.startsWith(route));
+
+  if (needsRawBody && (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH')) {
+    try {
+      const raw = await getRawBody(req, {
+        length: req.headers['content-length'],
+        limit: '50mb',
+        encoding: contentType.parse(req).parameters.charset || 'utf-8'
+      });
+      req.rawBody = raw;
+      
+      // Also parse as JSON if applicable
+      if (req.headers['content-type']?.includes('application/json')) {
+        try {
+          req.body = JSON.parse(raw);
+        } catch (e) {
+          logger.error(`JSON parse error: ${e.message}`);
         }
-      } catch (err) {
-        logger.error(`Error reading raw body: ${err.message}`);
       }
+    } catch (err) {
+      logger.error(`Error reading raw body: ${err.message}`);
     }
     return next();
   }
   
-  // For non-upstream routes, use regular JSON parsing
+  // For non-proxy routes, use regular JSON parsing
   express.json({ limit: '50mb' })(req, res, next);
 });
 
@@ -492,6 +506,7 @@ app.get('/v1/models', (req, res) => {
 });
 
 // Proxy OpenAI API requests
+// Update your /v1/chat/completions route to properly handle streaming
 app.post('/v1/chat/completions', async (req, res) => {
   const requestedModel = req.body.model;
   if (!requestedModel) {
@@ -506,13 +521,11 @@ app.post('/v1/chat/completions', async (req, res) => {
   try {
     const { processGroup, realModelName } = await processManager.swapProcessGroup(requestedModel);
 
-    // Get the specific process for this model and ensure it's ready
     const process = processGroup.processes.get(realModelName);
     if (!process) {
       throw new Error(`Could not find process for model ${realModelName}`);
     }
 
-    // Start the process if it's not already ready
     if (process.getCurrentState() !== ProcessState.READY) {
       logger.info(`<${realModelName}> Starting model process...`);
       const success = await process.start();
@@ -522,12 +535,11 @@ app.post('/v1/chat/completions', async (req, res) => {
       logger.info(`<${realModelName}> Model process started successfully`);
     }
 
-    // Modify the request to use the correct model name if needed
+    // Modify the request body
     if (modelConfig.useModelName) {
       req.body.model = modelConfig.useModelName;
     }
 
-    // Strip parameters if configured
     if (modelConfig.filters && modelConfig.filters.stripParams) {
       const stripParams = modelConfig.filters.stripParams.split(',')
         .map(param => param.trim())
@@ -538,30 +550,26 @@ app.post('/v1/chat/completions', async (req, res) => {
       }
     }
 
-    // Proxy the request to the model's server
-    const proxyOptions = {
-      target: modelConfig.proxy,
-      changeOrigin: true,
-      pathRewrite: {
-        '^/v1/chat/completions': '/v1/chat/completions'
-      },
-      onProxyReq: (proxyReq, req, res) => {
-        logger.debug(`<${realModelName}> Proxying request to ${modelConfig.proxy}`);
-      },
-      onProxyRes: (proxyRes, req, res) => {
-        logger.debug(`<${realModelName}> Received response with status ${proxyRes.statusCode}`);
-      }
-    };
+    // ✅ CRITICAL: Update rawBody after modifying body
+    req.rawBody = JSON.stringify(req.body);
 
-    // Apply the proxy middleware
-    createProxyMiddleware(proxyOptions)(req, res, () => {
-      res.status(500).json({ error: 'Proxy error' });
+    logger.info(`Proxying /v1/chat/completions to ${modelConfig.proxy}/v1/chat/completions`);
+
+    const proxy = getOrCreateProxy(modelConfig.proxy, {
+      '^/v1/chat/completions': '/v1/chat/completions'
     });
+    
+    proxy(req, res);
+    
   } catch (err) {
     logger.error(`Error proxying request: ${err.message}`);
-    res.status(500).json({ error: `error proxying request: ${err.message}` });
+    if (!res.headersSent) {
+      res.status(500).json({ error: `error proxying request: ${err.message}` });
+    }
   }
 });
+
+
 
 // Support for other OpenAI API endpoints
 const openaiEndpoints = [
